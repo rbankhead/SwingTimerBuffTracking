@@ -406,6 +406,19 @@ frame:SetScript("OnEvent", function(_, event, arg1)
 			end
 		end
 	elseif event == "PLAYER_LOGIN" then
+		-- This addon only has something to attach to once the native Swing
+		-- Timer bar itself is enabled - confirmed real CVar name
+		-- "showSwingTimer" (the same one Interface Options -> Advanced
+		-- Options' own "Enable Swing Timer" checkbox is wired to, and that
+		-- EditMode's own shouldEnableCVarName for the Swing Timer system
+		-- uses). Off by default on a fresh character (confirmed in-game),
+		-- which left this addon with no bar to find at all. Forced on here
+		-- rather than just failing with a print, since this addon is useless
+		-- without it.
+		if not GetCVarBool("showSwingTimer") then
+			SetCVar("showSwingTimer", "1")
+		end
+
 		if not AttachToSwingTimer() then
 			print("|cff33ccffSwingTimerBuffTracking|r: the selected native Swing Timer bar wasn't found; the native Swing Timer UI may have changed.")
 			return
