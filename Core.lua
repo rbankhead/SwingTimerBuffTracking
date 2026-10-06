@@ -39,6 +39,29 @@ local statusBar -- the chosen bar's StatusBar (see SWING_FRAME_NAMES), set once 
 local slots = {} -- slots[i] = { icon = Texture, countdown = FontString }, pooled and reused
 local trackedBuffs = {} -- trackedBuffs[i] = auraData, one slot per qualifying buff
 
+-- Confirmed in-game: "SwingTimerBuffTracking has been blocked from an action
+-- only available to the Blizzard UI" - WoW's older combat-lockdown system
+-- (separate from the secret-value restrictions elsewhere). First suspected
+-- this was only about CREATING new regions on statusBar (a child of the
+-- native Swing Timer frame, which inherits BottomManagedFrameTemplate, the
+-- same secure-adjacent bottom-HUD management the action bars use) -
+-- pre-creating every slot up front fixed that specific case, but the error
+-- still happened. Confirmed in-game a second time: it's broader than
+-- creation - REPOSITIONING an existing region that's already a child of
+-- that frame tree (PositionAll's own SetPoint calls, which run every frame
+-- while anything is tracked) is restricted too, during combat.
+--
+-- The real fix is to stop being a child of that frame tree at all. This
+-- overlay is an ordinary frame parented to UIParent - no secure/managed
+-- lineage of its own - sized and positioned to exactly cover statusBar via
+-- SetAllPoints once (safe: that's this addon's own frame taking statusBar
+-- as a position REFERENCE, not modifying statusBar's own children, the
+-- opposite direction from what's restricted). Every icon/countdown is a
+-- child of this overlay instead of statusBar directly, so nothing this
+-- addon ever does again - creating, resizing, or repositioning - touches
+-- the native frame's own hierarchy at all, in or out of combat.
+local overlayFrame = CreateFrame("Frame", nil, UIParent)
+
 -- For "appear" scale mode: how much time a buff had left at the moment it
 -- FIRST started being tracked, frozen per application. Keyed by spellId;
 -- {expirationTime, startRemaining}. A changed expirationTime means the buff
@@ -56,10 +79,10 @@ local function GetOrCreateSlot(i)
 		return slot
 	end
 
-	local icon = statusBar:CreateTexture(nil, "OVERLAY")
+	local icon = overlayFrame:CreateTexture(nil, "OVERLAY")
 	icon:SetSize(db.iconSize, db.iconSize)
 
-	local countdown = statusBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	local countdown = overlayFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	countdown:SetPoint("BOTTOM", icon, "TOP", 0, 1)
 
 	slot = { icon = icon, countdown = countdown }
@@ -75,22 +98,10 @@ local function HideSlot(i)
 	end
 end
 
--- Confirmed in-game: "SwingTimerBuffTracking has been blocked from an action
--- only available to the Blizzard UI" - WoW's older combat-lockdown system
--- (separate from the secret-value restrictions elsewhere), which blocks
--- creating new regions on frames tied to the secure/managed UI cluster
--- while in combat. statusBar is a child of the native Swing Timer frame
--- (inherits BottomManagedFrameTemplate, the same secure-adjacent bottom-HUD
--- management the action bars use), and this started happening right after
--- combat-log tracking was added below - that's the first path able to
--- track a genuinely NEW buff while already in combat (aura-based tracking
--- was itself blocked from seeing new buffs in combat), so it's the first
--- time GetOrCreateSlot ever ran mid-combat and actually needed to create a
--- new slot, rather than reuse an existing one. Pre-creating every slot up
--- front, out of combat (called once from PLAYER_LOGIN, which can't itself
--- happen mid-combat), means combat-log tracking only ever reuses already-
--- existing slots afterward - no CreateTexture/CreateFontString call is ever
--- made while in combat again.
+-- Belt-and-suspenders from chasing this bug's first (incomplete) diagnosis -
+-- harmless to keep now that overlayFrame makes it unnecessary for the
+-- combat-lockdown issue specifically, but there's no reason for slot
+-- creation to wait until the first buff shows up either way.
 local function PreCreateSlots()
 	for i = 1, MAX_TRACKED do
 		GetOrCreateSlot(i)
@@ -143,7 +154,7 @@ local function PositionAll()
 
 			local fraction = remaining / scaleDuration -- 1 at application (right edge) -> 0 at expiry (left edge)
 			local slot = slots[i]
-			slot.icon:SetPoint("CENTER", statusBar, "LEFT", fraction * statusBar:GetWidth(), 0)
+			slot.icon:SetPoint("CENTER", overlayFrame, "LEFT", fraction * overlayFrame:GetWidth(), 0)
 			slot.countdown:SetFormattedText("%.1f", remaining)
 			anyVisible = true
 		end
@@ -497,25 +508,30 @@ local function AttachToSwingTimer()
 	end
 
 	statusBar = swingFrame.StatusBar
+
+	-- Syncs overlayFrame to statusBar's current screen rect - this addon's
+	-- own frame reading statusBar's position as a reference, not touching
+	-- statusBar's own anchors/children, so it's safe regardless of combat
+	-- state (see overlayFrame's own comment above for why that direction
+	-- matters here). Strata/level pushed above statusBar's own so the icons
+	-- render on top of the bar instead of potentially behind it, now that
+	-- they're siblings in UIParent's tree rather than direct children.
+	overlayFrame:ClearAllPoints()
+	overlayFrame:SetAllPoints(statusBar)
+	overlayFrame:SetFrameStrata(statusBar:GetFrameStrata())
+	overlayFrame:SetFrameLevel(statusBar:GetFrameLevel() + 10)
+
 	return true
 end
 
 -- Called when the "Attach to bar" setting changes: re-finds the chosen
--- bar's StatusBar and reparents every existing icon/countdown onto it
--- (Texture/FontString both support SetParent after creation), rather than
--- discarding and recreating the pooled slots.
+-- bar's StatusBar and re-syncs overlayFrame to it. The icons/countdowns
+-- themselves stay put - they're children of overlayFrame, not statusBar
+-- directly, so there's nothing per-slot to reparent anymore.
 function Addon:ApplyAttachTo()
 	if not AttachToSwingTimer() then
 		print("|cff33ccffSwingTimerBuffTracking|r: that Swing Timer bar isn't available right now; keeping the previous attachment.")
 		return
-	end
-
-	for i = 1, #slots do
-		local slot = slots[i]
-		if slot then
-			slot.icon:SetParent(statusBar)
-			slot.countdown:SetParent(statusBar)
-		end
 	end
 
 	RefreshBuff()
