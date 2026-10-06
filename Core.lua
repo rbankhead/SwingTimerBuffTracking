@@ -189,12 +189,14 @@ end
 -- entirely in this addon's own Lua.
 --
 -- The very first time a given ability is ever seen there's no learned
--- duration yet, so that first application doesn't display (nothing to
--- animate a countdown against) - it's learned silently in the background,
--- and shows correctly from the very next cast onward, automatically, same
--- as everything else in this file (still filtered through the normal
--- selfOnly/blocklist/buffSourceMode/durationThreshold settings above -
--- there's no separate list or setting for this at all).
+-- duration yet - it still displays immediately even so, using
+-- db.durationThreshold as a provisional guess (see the combat log handler
+-- below), so every cast works, not just the second one onward. That
+-- provisional display self-corrects to the real learned duration as soon
+-- as it's actually observed expiring, automatically, same as everything
+-- else in this file (still filtered through the normal selfOnly/blocklist/
+-- buffSourceMode/durationThreshold settings above - there's no separate
+-- list or setting for this at all).
 --
 -- C_CombatLog.GetCurrentEventInfo() is the modern real name - confirmed via
 -- this client's own Deprecated_CombatLog.lua, where the old global
@@ -543,13 +545,27 @@ frame:SetScript("OnEvent", function(_, event, arg1)
 
 			pendingAuraStart[spellId] = GetTime()
 
-			local learned = db.learnedDurations[spellId]
-			if learned and DoesNameQualify(spellName, learned) then
+			-- The very first time an ability is ever seen there's no
+			-- learned duration yet - confirmed real complaint: silently
+			-- skipping that first cast and only tracking from the second
+			-- one onward isn't acceptable. db.durationThreshold stands in
+			-- as a provisional guess so it displays immediately every time,
+			-- not just after the first; DoesNameQualify trivially passes
+			-- its own duration<=threshold check against that guess, so this
+			-- only changes WHEN a never-before-seen ability starts
+			-- displaying, not the qualification rules. The provisional
+			-- display self-corrects the moment the real duration is
+			-- learned below (on SPELL_AURA_REMOVED) and used for every
+			-- cast after - a buff that turns out to run longer than the
+			-- threshold just stops qualifying from the second cast on, the
+			-- same as it always would have.
+			local duration = db.learnedDurations[spellId] or db.durationThreshold
+			if DoesNameQualify(spellName, duration) then
 				combatLogBuffs[spellId] = {
 					spellId = spellId,
 					name = spellName,
 					icon = C_Spell.GetSpellTexture(spellId),
-					expirationTime = GetTime() + learned,
+					expirationTime = GetTime() + duration,
 					isFromPlayerOrPlayerPet = true,
 					isCombatLogSourced = true,
 				}
