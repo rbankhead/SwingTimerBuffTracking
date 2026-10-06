@@ -109,6 +109,34 @@ local function PreCreateSlots()
 	end
 end
 
+-- Confirmed in-game: the real trigger for "blocked from an action only
+-- available to the Blizzard UI" was neither of the two things this addon
+-- tried fixing before (slot creation, then slot repositioning) - it was a
+-- wrong assumption underneath both of them. PLAYER_LOGIN was assumed to
+-- "not itself happen mid-combat", true for a real login but not for a
+-- /reload - confirmed directly: the player reloaded WHILE already in
+-- combat, so PLAYER_LOGIN's own setup work (AttachToSwingTimer syncing
+-- overlayFrame, PreCreateSlots, RefreshBuff) ran mid-combat for the first
+-- time, tripping combat lockdown on something in that path. The fix isn't
+-- another frame-handling change - it's not running any of this setup while
+-- InCombatLockdown() is true at all (confirmed real, standard API), and
+-- waiting for the real PLAYER_REGEN_ENABLED event (confirmed real, fires
+-- when combat actually ends) to run it instead. Also used for ApplyAttachTo
+-- below, since changing the "Attach to bar" setting does the same
+-- overlayFrame sync and could in principle be changed mid-combat too.
+local function RunWhenSafe(fn)
+	if InCombatLockdown() then
+		local waiter = CreateFrame("Frame")
+		waiter:RegisterEvent("PLAYER_REGEN_ENABLED")
+		waiter:SetScript("OnEvent", function(self)
+			self:UnregisterEvent("PLAYER_REGEN_ENABLED")
+			fn()
+		end)
+	else
+		fn()
+	end
+end
+
 local function StopAll()
 	trackedBuffs = {}
 	wipe(startRemainingCache)
@@ -529,12 +557,14 @@ end
 -- themselves stay put - they're children of overlayFrame, not statusBar
 -- directly, so there's nothing per-slot to reparent anymore.
 function Addon:ApplyAttachTo()
-	if not AttachToSwingTimer() then
-		print("|cff33ccffSwingTimerBuffTracking|r: that Swing Timer bar isn't available right now; keeping the previous attachment.")
-		return
-	end
+	RunWhenSafe(function()
+		if not AttachToSwingTimer() then
+			print("|cff33ccffSwingTimerBuffTracking|r: that Swing Timer bar isn't available right now; keeping the previous attachment.")
+			return
+		end
 
-	RefreshBuff()
+		RefreshBuff()
+	end)
 end
 
 local frame = CreateFrame("Frame")
@@ -631,12 +661,14 @@ frame:SetScript("OnEvent", function(_, event, arg1)
 			SetCVar("showSwingTimer", "1")
 		end
 
-		if not AttachToSwingTimer() then
-			print("|cff33ccffSwingTimerBuffTracking|r: the selected native Swing Timer bar wasn't found; the native Swing Timer UI may have changed.")
-			return
-		end
-		PreCreateSlots()
-		RefreshBuff()
+		RunWhenSafe(function()
+			if not AttachToSwingTimer() then
+				print("|cff33ccffSwingTimerBuffTracking|r: the selected native Swing Timer bar wasn't found; the native Swing Timer UI may have changed.")
+				return
+			end
+			PreCreateSlots()
+			RefreshBuff()
+		end)
 	elseif event == "UNIT_AURA" then
 		RefreshBuff()
 	end
