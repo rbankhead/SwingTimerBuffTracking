@@ -296,28 +296,19 @@ function Options:Init()
 		function(name) Addon:RemoveBlock(name) end,
 		function() return Addon.db.blocklist end)
 
-	local allowEditor, allowBottom = MakeListEditor(panel, sourceDropdown, 0,
+	local allowEditor = MakeListEditor(panel, sourceDropdown, 0,
 		"Allowlist (used by Buff source above)",
 		function(name) Addon:AddAllow(name) end,
 		function(name) Addon:RemoveAllow(name) end,
 		function() return Addon.db.allowlist end)
 
-	-- Works even during combat, unlike everything above - see the real
-	-- SPELL_CAST_SUCCESS-based tracking this drives in Core.lua, added
-	-- after a Warrior's self-cast Bloodrage (always used mid-fight) was
-	-- confirmed invisible to the aura-read modes above (ShouldAurasBeSecret
-	-- is true in combat on this client, blocking those reads entirely).
-	local combatDescLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-	combatDescLabel:SetPoint("TOPLEFT", allowBottom, "BOTTOMLEFT", -RIGHT_COL_X - 2, -12)
-	combatDescLabel:SetPoint("RIGHT", panel, "RIGHT", -16, 0)
-	combatDescLabel:SetJustifyH("LEFT")
-	combatDescLabel:SetText("Combat-tracked buffs - works even during combat, unlike everything above, but only for abilities listed here with their known duration.")
-
-	local combatEditor = MakeListEditor(panel, combatDescLabel, 0,
-		"Combat-tracked buffs (Name:Seconds, e.g. Bloodrage:10)",
-		function(entry) Addon:AddCombatBuff(entry) end,
-		function(entry) Addon:RemoveCombatBuff(entry) end,
-		function() return Addon.db.combatBuffs end)
+	-- No combat-tracked-buffs list here on purpose - that used to be a
+	-- manual "Name:Seconds" list, explicitly rejected in favor of fully
+	-- automatic tracking. It's automatic now: Core.lua learns each ability's
+	-- duration itself from combat log timestamps the first time it's seen,
+	-- and uses the existing Buff source/Blocklist/Allowlist settings above
+	-- for everything it tracks afterward, in or out of combat - nothing to
+	-- configure here.
 
 	function panel:Refresh()
 		enable:SetChecked(db.enabled)
@@ -326,7 +317,6 @@ function Options:Init()
 		iconSizeSlider:SetValue(db.iconSize)
 		blockEditor:Refresh()
 		allowEditor:Refresh()
-		combatEditor:Refresh()
 	end
 	panel:SetScript("OnShow", panel.Refresh)
 

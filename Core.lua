@@ -19,7 +19,7 @@ local DEFAULTS = {
 	buffSourceMode = "duration", -- "duration" | "allowlist" | "both" - see CollectQualifyingBuffs
 	blocklist = {}, -- array of buff names that never appear, regardless of any other setting
 	allowlist = {}, -- array of buff names used by buffSourceMode "allowlist"/"both"
-	combatBuffs = {}, -- array of "Name:Seconds" strings - see the combat-log tracking section below
+	learnedDurations = {}, -- [spellId] = seconds, auto-learned - see the combat-log tracking section below
 }
 Addon.DEFAULTS = DEFAULTS
 
@@ -174,34 +174,35 @@ end
 --
 -- Combat log events aren't blocked by it though - that's the same reason
 -- the native Damage Meter itself keeps working mid-fight, since it's driven
--- by combat log data rather than aura reads. So for abilities with a known,
--- fixed duration (listed below by the player, since there's no API to look
--- up a spell's base duration), this tracks them from the real
--- SPELL_CAST_SUCCESS combat log subevent instead of an aura read -
--- computing its own expirationTime (GetTime() + the listed duration) rather
--- than ever touching the live aura at all, so it works identically in and
--- out of combat.
+-- by combat log data rather than aura reads. There's no API to look up a
+-- spell's base duration directly (confirmed: nothing like GetSpellDuration
+-- exists), and a hardcoded per-spell list is explicitly not wanted - so
+-- instead this LEARNS each ability's duration automatically, the first time
+-- it's ever seen, from nothing but two plain GetTime() timestamps:
+-- SPELL_AURA_APPLIED/SPELL_AURA_REFRESH (confirmed real subevents, used
+-- throughout this client's own CombatLogProcessor) mark when a buff starts,
+-- SPELL_AURA_REMOVED marks when it ends - the elapsed time between them is
+-- the real duration, cached per spellId in db.learnedDurations and reused
+-- on every later cast of the same ability. Nothing here ever touches a live
+-- aura value, secret or not, so none of it is at risk of the taint/secrecy
+-- issues elsewhere in this addon - it's pure event timestamps, computed
+-- entirely in this addon's own Lua.
+--
+-- The very first time a given ability is ever seen there's no learned
+-- duration yet, so that first application doesn't display (nothing to
+-- animate a countdown against) - it's learned silently in the background,
+-- and shows correctly from the very next cast onward, automatically, same
+-- as everything else in this file (still filtered through the normal
+-- selfOnly/blocklist/buffSourceMode/durationThreshold settings above -
+-- there's no separate list or setting for this at all).
 --
 -- C_CombatLog.GetCurrentEventInfo() is the modern real name - confirmed via
 -- this client's own Deprecated_CombatLog.lua, where the old global
 -- CombatLogGetCurrentEventInfo is defined as nothing but an alias to it.
--- Its SPELL_* subevent extra args (spellId, spellName, spellSchool) are
--- standard, long-documented WoW combat log API; unlike the rest of this
--- comment, that specific ordering isn't something this client's own source
--- happened to confirm directly, just well-established across the game's
--- history.
-local combatLogBuffs = {} -- [spellId] = { spellId=, name=, icon=, expirationTime=, isFromPlayerOrPlayerPet=true }
-local combatBuffDurations = {} -- [lowercase name] = duration in seconds, rebuilt whenever db.combatBuffs changes
-
-local function RebuildCombatBuffDurations()
-	wipe(combatBuffDurations)
-	for _, entry in ipairs(db.combatBuffs) do
-		local name, seconds = entry:match("^(.-):(%d+%.?%d*)$")
-		if name and seconds then
-			combatBuffDurations[name:lower()] = tonumber(seconds)
-		end
-	end
-end
+-- Its SPELL_AURA_* extra args (spellId, spellName, spellSchool, auraType)
+-- are confirmed in this client's own Blizzard_CombatLogProcessor.lua.
+local combatLogBuffs = {} -- [spellId] = { spellId=, name=, icon=, expirationTime=, isFromPlayerOrPlayerPet=true, isCombatLogSourced=true }
+local pendingAuraStart = {} -- [spellId] = GetTime() when APPLIED/REFRESH was last seen, cleared on REMOVED
 
 local function PruneCombatLogBuffs()
 	local now = GetTime()
@@ -224,6 +225,26 @@ local function NameInList(list, name)
 		end
 	end
 	return false
+end
+
+-- Same qualification rule CollectQualifyingBuffs applies inline to a live
+-- aura's remaining time, factored out so the combat-log path below can
+-- apply the identical rule to a just-learned duration (the two are
+-- equivalent the moment a buff is freshly applied - remaining == full
+-- duration). Blocklist always applies regardless of mode, matching the
+-- aura-scan path.
+local function DoesNameQualify(name, durationSeconds)
+	if NameInList(db.blocklist, name) then
+		return false
+	end
+	local mode = db.buffSourceMode
+	if mode == "allowlist" then
+		return NameInList(db.allowlist, name)
+	elseif mode == "both" then
+		return NameInList(db.allowlist, name) and durationSeconds <= db.durationThreshold
+	else
+		return durationSeconds <= db.durationThreshold
+	end
 end
 
 -- Collects buffs (self-applied only when db.selfOnly is set, otherwise any
@@ -448,55 +469,6 @@ end
 Addon.AddBlock, Addon.RemoveBlock = MakeListMutators("blocklist")
 Addon.AddAllow, Addon.RemoveAllow = MakeListMutators("allowlist")
 
--- "Name:Seconds" entries only, distinct from AddToList/RemoveFromList's
--- plain-name format - these drive combat-log tracking (see
--- RebuildCombatBuffDurations), not an aura-name check, so they need a
--- duration attached. Returns true if the entry is in the list afterward.
-local function AddCombatBuff(_, raw)
-	raw = strtrim(raw or "")
-	local name, seconds = raw:match("^(.-):%s*(%d+%.?%d*)%s*$")
-	name = name and strtrim(name)
-	if not name or name == "" or not tonumber(seconds) or tonumber(seconds) <= 0 then
-		print("|cff33ccffSwingTimerBuffTracking|r: combat-tracked buffs need the format \"Name:Seconds\", e.g. \"Bloodrage:10\".")
-		return false
-	end
-	WarnIfUnrecognizedSpell(name)
-	local normalized = name .. ":" .. tostring(tonumber(seconds))
-	for i, existing in ipairs(db.combatBuffs) do
-		local existingName = existing:match("^(.-):")
-		if existingName and existingName:lower() == name:lower() then
-			db.combatBuffs[i] = normalized -- replace, e.g. to change the duration
-			RebuildCombatBuffDurations()
-			return true
-		end
-	end
-	table.insert(db.combatBuffs, normalized)
-	RebuildCombatBuffDurations()
-	return true
-end
-
--- raw is whatever the list editor's remove button passes, which is the full
--- stored entry ("Bloodrage:10"), not just the name - MakeListEditor's
--- removeFn always receives the exact string from getList().
-local function RemoveCombatBuff(_, raw)
-	local name = (raw or ""):match("^(.-):") or raw
-	name = strtrim(name or ""):lower()
-	if name == "" then
-		return
-	end
-	for i, existing in ipairs(db.combatBuffs) do
-		local existingName = existing:match("^(.-):")
-		if existingName and existingName:lower() == name then
-			table.remove(db.combatBuffs, i)
-			RebuildCombatBuffDurations()
-			return
-		end
-	end
-end
-
-Addon.AddCombatBuff = AddCombatBuff
-Addon.RemoveCombatBuff = RemoveCombatBuff
-
 function Addon:ApplyIconSize()
 	for i = 1, #slots do
 		if slots[i] then
@@ -554,26 +526,52 @@ frame:RegisterUnitEvent("UNIT_AURA", "player")
 frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:SetScript("OnEvent", function(_, event, arg1)
 	if event == "COMBAT_LOG_EVENT_UNFILTERED" then
-		if not db or not next(combatBuffDurations) then
+		if not db then
 			return
 		end
-		local _, subevent, _, sourceGUID, _, _, _, _, _, _, _, spellId, spellName = C_CombatLog.GetCurrentEventInfo()
-		if subevent ~= "SPELL_CAST_SUCCESS" or sourceGUID ~= UnitGUID("player") or not spellName then
+		local _, subevent, _, sourceGUID, _, _, _, destGUID, _, _, _, spellId, spellName, _, auraType = C_CombatLog.GetCurrentEventInfo()
+		if destGUID ~= UnitGUID("player") then
 			return
 		end
-		local duration = combatBuffDurations[spellName:lower()]
-		if not duration then
-			return
+		if subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH" then
+			if auraType ~= "BUFF" or not spellId or not spellName then
+				return
+			end
+			if db.selfOnly and sourceGUID ~= UnitGUID("player") then
+				return
+			end
+
+			pendingAuraStart[spellId] = GetTime()
+
+			local learned = db.learnedDurations[spellId]
+			if learned and DoesNameQualify(spellName, learned) then
+				combatLogBuffs[spellId] = {
+					spellId = spellId,
+					name = spellName,
+					icon = C_Spell.GetSpellTexture(spellId),
+					expirationTime = GetTime() + learned,
+					isFromPlayerOrPlayerPet = true,
+					isCombatLogSourced = true,
+				}
+				RefreshBuff()
+			end
+		elseif subevent == "SPELL_AURA_REMOVED" then
+			if auraType ~= "BUFF" or not spellId then
+				return
+			end
+			local startedAt = pendingAuraStart[spellId]
+			if startedAt then
+				pendingAuraStart[spellId] = nil
+				local observed = GetTime() - startedAt
+				if observed > 0 then
+					db.learnedDurations[spellId] = observed
+				end
+			end
+			if combatLogBuffs[spellId] then
+				combatLogBuffs[spellId] = nil
+				RefreshBuff()
+			end
 		end
-		combatLogBuffs[spellId] = {
-			spellId = spellId,
-			name = spellName,
-			icon = C_Spell.GetSpellTexture(spellId),
-			expirationTime = GetTime() + duration,
-			isFromPlayerOrPlayerPet = true,
-			isCombatLogSourced = true,
-		}
-		RefreshBuff()
 		return
 	end
 
@@ -583,7 +581,6 @@ frame:SetScript("OnEvent", function(_, event, arg1)
 			ApplyDefaults(SwingTimerBuffTrackingDB, DEFAULTS)
 			db = SwingTimerBuffTrackingDB
 			Addon.db = db
-			RebuildCombatBuffDurations()
 			if Addon.Options then
 				Addon.Options:Init()
 			end
