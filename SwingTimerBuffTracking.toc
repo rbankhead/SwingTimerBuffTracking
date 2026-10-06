@@ -1,8 +1,8 @@
 ## Interface: 16001
 ## Title: SwingTimerBuffTracking
-## Notes: Tracks buffs whose remaining time is under a configurable threshold (seals, Slice and Dice, Enrage, or any longer buff once it's down to its last seconds; self-applied only by default), or buffs chosen by name via an allowlist, on a native Swing Timer bar (main-hand, off-hand, or ranged). A blocklist always excludes named buffs regardless of other settings. Each qualifying buff's icon slides right-to-left as it counts down; all qualifying buffs show at once. Works for any class.
+## Notes: Tracks buffs whose remaining time is under a configurable threshold (seals, Slice and Dice, Enrage, or any longer buff once it's down to its last seconds; self-applied only by default), or buffs chosen by name via an allowlist, on a native Swing Timer bar (main-hand, off-hand, or ranged). A blocklist always excludes named buffs regardless of other settings. A separate combat-tracked list (Name:Seconds) works even during combat, unlike the modes above, for abilities with a known duration. Each qualifying buff's icon slides right-to-left as it counts down; all qualifying buffs show at once. Works for any class.
 ## Author: Richard Bankhead
-## Version: 4.4.0
+## Version: 4.5.0
 ## SavedVariablesPerCharacter: SwingTimerBuffTrackingDB
 
 Core.lua

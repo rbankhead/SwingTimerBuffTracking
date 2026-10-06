@@ -19,6 +19,7 @@ local DEFAULTS = {
 	buffSourceMode = "duration", -- "duration" | "allowlist" | "both" - see CollectQualifyingBuffs
 	blocklist = {}, -- array of buff names that never appear, regardless of any other setting
 	allowlist = {}, -- array of buff names used by buffSourceMode "allowlist"/"both"
+	combatBuffs = {}, -- array of "Name:Seconds" strings - see the combat-log tracking section below
 }
 Addon.DEFAULTS = DEFAULTS
 
@@ -71,6 +72,29 @@ local function HideSlot(i)
 	if slot then
 		slot.icon:Hide()
 		slot.countdown:Hide()
+	end
+end
+
+-- Confirmed in-game: "SwingTimerBuffTracking has been blocked from an action
+-- only available to the Blizzard UI" - WoW's older combat-lockdown system
+-- (separate from the secret-value restrictions elsewhere), which blocks
+-- creating new regions on frames tied to the secure/managed UI cluster
+-- while in combat. statusBar is a child of the native Swing Timer frame
+-- (inherits BottomManagedFrameTemplate, the same secure-adjacent bottom-HUD
+-- management the action bars use), and this started happening right after
+-- combat-log tracking was added below - that's the first path able to
+-- track a genuinely NEW buff while already in combat (aura-based tracking
+-- was itself blocked from seeing new buffs in combat), so it's the first
+-- time GetOrCreateSlot ever ran mid-combat and actually needed to create a
+-- new slot, rather than reuse an existing one. Pre-creating every slot up
+-- front, out of combat (called once from PLAYER_LOGIN, which can't itself
+-- happen mid-combat), means combat-log tracking only ever reuses already-
+-- existing slots afterward - no CreateTexture/CreateFontString call is ever
+-- made while in combat again.
+local function PreCreateSlots()
+	for i = 1, MAX_TRACKED do
+		GetOrCreateSlot(i)
+		HideSlot(i)
 	end
 end
 
@@ -136,6 +160,56 @@ end
 -- last-known buffs, counting down on their own cached expirationTime.
 local function AurasAreReadable()
 	return not (C_Secrets and C_Secrets.ShouldAurasBeSecret and C_Secrets.ShouldAurasBeSecret())
+end
+
+-- Confirmed in-game: ShouldAurasBeSecret() is true while the player is in
+-- combat on this client, which blocks the scan above entirely - so a buff
+-- applied DURING combat (a Warrior's self-cast Bloodrage, reported not
+-- showing) is invisible until combat ends, even though one applied BEFORE
+-- combat (a Paladin's seal) keeps counting down fine, since no new read is
+-- needed for a buff already being tracked from its cached expirationTime.
+-- There's no way to read around that restriction - it's deliberate, the
+-- same anti-automation system that blocks the Damage Meter's own live
+-- secret-number comparisons in SymmetricalChatAndDamageMeter.
+--
+-- Combat log events aren't blocked by it though - that's the same reason
+-- the native Damage Meter itself keeps working mid-fight, since it's driven
+-- by combat log data rather than aura reads. So for abilities with a known,
+-- fixed duration (listed below by the player, since there's no API to look
+-- up a spell's base duration), this tracks them from the real
+-- SPELL_CAST_SUCCESS combat log subevent instead of an aura read -
+-- computing its own expirationTime (GetTime() + the listed duration) rather
+-- than ever touching the live aura at all, so it works identically in and
+-- out of combat.
+--
+-- C_CombatLog.GetCurrentEventInfo() is the modern real name - confirmed via
+-- this client's own Deprecated_CombatLog.lua, where the old global
+-- CombatLogGetCurrentEventInfo is defined as nothing but an alias to it.
+-- Its SPELL_* subevent extra args (spellId, spellName, spellSchool) are
+-- standard, long-documented WoW combat log API; unlike the rest of this
+-- comment, that specific ordering isn't something this client's own source
+-- happened to confirm directly, just well-established across the game's
+-- history.
+local combatLogBuffs = {} -- [spellId] = { spellId=, name=, icon=, expirationTime=, isFromPlayerOrPlayerPet=true }
+local combatBuffDurations = {} -- [lowercase name] = duration in seconds, rebuilt whenever db.combatBuffs changes
+
+local function RebuildCombatBuffDurations()
+	wipe(combatBuffDurations)
+	for _, entry in ipairs(db.combatBuffs) do
+		local name, seconds = entry:match("^(.-):(%d+%.?%d*)$")
+		if name and seconds then
+			combatBuffDurations[name:lower()] = tonumber(seconds)
+		end
+	end
+end
+
+local function PruneCombatLogBuffs()
+	local now = GetTime()
+	for spellId, entry in pairs(combatLogBuffs) do
+		if entry.expirationTime <= now then
+			combatLogBuffs[spellId] = nil
+		end
+	end
 end
 
 -- Case-insensitive exact-name check against a list (blocklist/allowlist).
@@ -214,13 +288,47 @@ local function RefreshBuff()
 		return
 	end
 
-	if not AurasAreReadable() then
-		return
+	PruneCombatLogBuffs()
+
+	-- Aura-sourced half of the list: a fresh scan when readable, or (when
+	-- not - the auras-secret-in-combat case) whatever aura-sourced entries
+	-- were already being tracked, carried forward rather than wiped, since
+	-- their cached expirationTime is still good for display even though a
+	-- new read isn't possible right now. Combat-log-sourced entries are
+	-- never carried forward this way - combatLogBuffs below is already the
+	-- authoritative, continuously-updated source for those.
+	local buffs
+	local freshAuraScan = false
+	if AurasAreReadable() then
+		local ok, auraBuffs = CollectQualifyingBuffs()
+		if ok then
+			buffs = auraBuffs
+			freshAuraScan = true
+		end
+	end
+	if not freshAuraScan then
+		buffs = {}
+		for _, buff in ipairs(trackedBuffs) do
+			if not buff.isCombatLogSourced then
+				buffs[#buffs + 1] = buff
+			end
+		end
 	end
 
-	local ok, buffs = CollectQualifyingBuffs()
-	if not ok then
-		return -- read was blocked; keep showing whatever we last knew
+	-- Combat-log-sourced half: always re-added fresh regardless of aura
+	-- readability, since these never depended on an aura read at all.
+	local now = GetTime()
+	for _, entry in pairs(combatLogBuffs) do
+		if not NameInList(db.blocklist, entry.name) then
+			buffs[#buffs + 1] = entry
+		end
+	end
+
+	table.sort(buffs, function(a, b)
+		return (a.expirationTime - now) > (b.expirationTime - now)
+	end)
+	for i = #buffs, MAX_TRACKED + 1, -1 do
+		buffs[i] = nil
 	end
 
 	local previousCount = #trackedBuffs
@@ -340,6 +448,55 @@ end
 Addon.AddBlock, Addon.RemoveBlock = MakeListMutators("blocklist")
 Addon.AddAllow, Addon.RemoveAllow = MakeListMutators("allowlist")
 
+-- "Name:Seconds" entries only, distinct from AddToList/RemoveFromList's
+-- plain-name format - these drive combat-log tracking (see
+-- RebuildCombatBuffDurations), not an aura-name check, so they need a
+-- duration attached. Returns true if the entry is in the list afterward.
+local function AddCombatBuff(_, raw)
+	raw = strtrim(raw or "")
+	local name, seconds = raw:match("^(.-):%s*(%d+%.?%d*)%s*$")
+	name = name and strtrim(name)
+	if not name or name == "" or not tonumber(seconds) or tonumber(seconds) <= 0 then
+		print("|cff33ccffSwingTimerBuffTracking|r: combat-tracked buffs need the format \"Name:Seconds\", e.g. \"Bloodrage:10\".")
+		return false
+	end
+	WarnIfUnrecognizedSpell(name)
+	local normalized = name .. ":" .. tostring(tonumber(seconds))
+	for i, existing in ipairs(db.combatBuffs) do
+		local existingName = existing:match("^(.-):")
+		if existingName and existingName:lower() == name:lower() then
+			db.combatBuffs[i] = normalized -- replace, e.g. to change the duration
+			RebuildCombatBuffDurations()
+			return true
+		end
+	end
+	table.insert(db.combatBuffs, normalized)
+	RebuildCombatBuffDurations()
+	return true
+end
+
+-- raw is whatever the list editor's remove button passes, which is the full
+-- stored entry ("Bloodrage:10"), not just the name - MakeListEditor's
+-- removeFn always receives the exact string from getList().
+local function RemoveCombatBuff(_, raw)
+	local name = (raw or ""):match("^(.-):") or raw
+	name = strtrim(name or ""):lower()
+	if name == "" then
+		return
+	end
+	for i, existing in ipairs(db.combatBuffs) do
+		local existingName = existing:match("^(.-):")
+		if existingName and existingName:lower() == name then
+			table.remove(db.combatBuffs, i)
+			RebuildCombatBuffDurations()
+			return
+		end
+	end
+end
+
+Addon.AddCombatBuff = AddCombatBuff
+Addon.RemoveCombatBuff = RemoveCombatBuff
+
 function Addon:ApplyIconSize()
 	for i = 1, #slots do
 		if slots[i] then
@@ -394,13 +551,39 @@ local frame = CreateFrame("Frame")
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterUnitEvent("UNIT_AURA", "player")
+frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 frame:SetScript("OnEvent", function(_, event, arg1)
+	if event == "COMBAT_LOG_EVENT_UNFILTERED" then
+		if not db or not next(combatBuffDurations) then
+			return
+		end
+		local _, subevent, _, sourceGUID, _, _, _, _, _, _, _, spellId, spellName = C_CombatLog.GetCurrentEventInfo()
+		if subevent ~= "SPELL_CAST_SUCCESS" or sourceGUID ~= UnitGUID("player") or not spellName then
+			return
+		end
+		local duration = combatBuffDurations[spellName:lower()]
+		if not duration then
+			return
+		end
+		combatLogBuffs[spellId] = {
+			spellId = spellId,
+			name = spellName,
+			icon = C_Spell.GetSpellTexture(spellId),
+			expirationTime = GetTime() + duration,
+			isFromPlayerOrPlayerPet = true,
+			isCombatLogSourced = true,
+		}
+		RefreshBuff()
+		return
+	end
+
 	if event == "ADDON_LOADED" then
 		if arg1 == ADDON_NAME then
 			SwingTimerBuffTrackingDB = SwingTimerBuffTrackingDB or {}
 			ApplyDefaults(SwingTimerBuffTrackingDB, DEFAULTS)
 			db = SwingTimerBuffTrackingDB
 			Addon.db = db
+			RebuildCombatBuffDurations()
 			if Addon.Options then
 				Addon.Options:Init()
 			end
@@ -423,6 +606,7 @@ frame:SetScript("OnEvent", function(_, event, arg1)
 			print("|cff33ccffSwingTimerBuffTracking|r: the selected native Swing Timer bar wasn't found; the native Swing Timer UI may have changed.")
 			return
 		end
+		PreCreateSlots()
 		RefreshBuff()
 	elseif event == "UNIT_AURA" then
 		RefreshBuff()

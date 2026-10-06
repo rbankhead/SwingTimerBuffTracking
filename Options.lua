@@ -180,7 +180,16 @@ local function MakeListEditor(parent, topAnchor, xOffset, titleText, addFn, remo
 	local addBtn = MakeButton(parent, "Add", 70, DoAdd)
 	addBtn:SetPoint("LEFT", box, "RIGHT", 6, 1)
 
-	return editor
+	-- Invisible anchor at this editor's true bottom (fixed height: LIST_ROWS
+	-- rows regardless of how many entries actually exist), so a second
+	-- editor placed below has something real to chain its own topAnchor to -
+	-- editor itself is a plain Lua table, not a frame, so it can't be
+	-- anchored to directly.
+	local bottomAnchor = CreateFrame("Frame", nil, parent)
+	bottomAnchor:SetSize(1, 1)
+	bottomAnchor:SetPoint("TOPLEFT", box, "BOTTOMLEFT", 0, -6 - (LIST_ROWS * LIST_ROW_HEIGHT))
+
+	return editor, bottomAnchor
 end
 
 function Options:Init()
@@ -287,11 +296,28 @@ function Options:Init()
 		function(name) Addon:RemoveBlock(name) end,
 		function() return Addon.db.blocklist end)
 
-	local allowEditor = MakeListEditor(panel, sourceDropdown, 0,
+	local allowEditor, allowBottom = MakeListEditor(panel, sourceDropdown, 0,
 		"Allowlist (used by Buff source above)",
 		function(name) Addon:AddAllow(name) end,
 		function(name) Addon:RemoveAllow(name) end,
 		function() return Addon.db.allowlist end)
+
+	-- Works even during combat, unlike everything above - see the real
+	-- SPELL_CAST_SUCCESS-based tracking this drives in Core.lua, added
+	-- after a Warrior's self-cast Bloodrage (always used mid-fight) was
+	-- confirmed invisible to the aura-read modes above (ShouldAurasBeSecret
+	-- is true in combat on this client, blocking those reads entirely).
+	local combatDescLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	combatDescLabel:SetPoint("TOPLEFT", allowBottom, "BOTTOMLEFT", -RIGHT_COL_X - 2, -12)
+	combatDescLabel:SetPoint("RIGHT", panel, "RIGHT", -16, 0)
+	combatDescLabel:SetJustifyH("LEFT")
+	combatDescLabel:SetText("Combat-tracked buffs - works even during combat, unlike everything above, but only for abilities listed here with their known duration.")
+
+	local combatEditor = MakeListEditor(panel, combatDescLabel, 0,
+		"Combat-tracked buffs (Name:Seconds, e.g. Bloodrage:10)",
+		function(entry) Addon:AddCombatBuff(entry) end,
+		function(entry) Addon:RemoveCombatBuff(entry) end,
+		function() return Addon.db.combatBuffs end)
 
 	function panel:Refresh()
 		enable:SetChecked(db.enabled)
@@ -300,6 +326,7 @@ function Options:Init()
 		iconSizeSlider:SetValue(db.iconSize)
 		blockEditor:Refresh()
 		allowEditor:Refresh()
+		combatEditor:Refresh()
 	end
 	panel:SetScript("OnShow", panel.Refresh)
 
